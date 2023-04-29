@@ -18,12 +18,13 @@ void initialiseBuckets(struct Bucket* buckets, int bucketCount);
 int fillBuckets(const float* floatArrayToSort, int size,
                 struct Bucket* buckets, int bucketCount);
 void freeBuckets(struct Bucket* buckets, int bucketCount);
+void mergesort_parallel(float* array, int size, int threads);
 void mergesort(float* array, int low, int high);
 void merge(float* floatArrayToSort, int low, int mid, int high);
 
 
 int bucketsort(float* floatArrayToSort, int arraySize, int threadCount,
-               int bucketCount) {
+               int bucketCount, int threadsPerThread) {
     /*
      * @param floatArrayToSort      Array to sort, self-descriptive
      * @param arraySize             Size of the array to sort
@@ -74,7 +75,7 @@ int bucketsort(float* floatArrayToSort, int arraySize, int threadCount,
     #pragma omp parallel for \
     private(itemsInBucket) \
     shared(buckets, bucketCount, numbersInBuckets, sizes) \
-    shared(errorOccurred) \
+    shared(errorOccurred, threadsPerThread) \
     default(none) num_threads(threadCount)
     for (int i = 0; i < bucketCount; i++) {
         if (errorOccurred) continue; // Do not proceed anymore if error occurred.
@@ -86,21 +87,21 @@ int bucketsort(float* floatArrayToSort, int arraySize, int threadCount,
         if (!numbersInBuckets[i]) {
             for (int j = 0; j < i; j++) free(numbersInBuckets[j]);
             errorOccurred = 1;
+            continue;
         }
-        else {
-            if (!itemsInBucket) {
-                continue;
-            }
-            for (int j = 0; j < itemsInBucket; j++) {
-                numbersInBuckets[i][j] = currentBucket->value;
-                prevBucket = currentBucket;
-                currentBucket = currentBucket->next;
-                if (j == 0) continue; // first bucket allocated on stack
-                // Freeing buckets here saves the need to use another loop to do so.
-                free(prevBucket);
-            }
-            mergesort(numbersInBuckets[i], 0, itemsInBucket - 1);
+        if (!itemsInBucket) {
+            continue;
         }
+        for (int j = 0; j < itemsInBucket; j++) {
+            numbersInBuckets[i][j] = currentBucket->value;
+            prevBucket = currentBucket;
+            currentBucket = currentBucket->next;
+            if (j == 0) continue; // first bucket allocated on stack
+            // Freeing buckets here saves the need to use another loop to do so.
+            free(prevBucket);
+        }
+        mergesort_parallel(numbersInBuckets[i], itemsInBucket, threadsPerThread);
+//            mergesort(numbersInBuckets[i], 0, itemsInBucket - 1);
     }
     free(buckets);
     if (errorOccurred) {
@@ -144,7 +145,6 @@ void freeBuckets(struct Bucket* buckets, int bucketCount) {
 int fillBuckets(const float* floatArrayToSort, int size, struct Bucket* buckets, int bucketCount) {
     float currentItem;
     struct Bucket *bucket;
-    float bucketLimit = 0.1 * bucketCount;
     for (int i = 0; i < size; i++) {
         currentItem = floatArrayToSort[i];
         if (currentItem < 0) {
@@ -152,7 +152,8 @@ int fillBuckets(const float* floatArrayToSort, int size, struct Bucket* buckets,
             printf("Invalid input: Negative numbers.\n");
             return 0; // No negative numbers allowed
         }
-        if (currentItem < bucketLimit) {
+        // ASSUMES NUMBERS WILL BE FROM 0 TO 1. EXPLAIN IN DISS - OVERVIEW OF ALGORITHM. IF NUMBERS ABOVE 1, PERFORMANCE = BAD.
+        if (currentItem < 0.9) {
             bucket = &(buckets[(int) (currentItem * 10)]);
         } else { // If larger than limit, store in the final bucket
             bucket = &buckets[bucketCount-1];
@@ -162,37 +163,68 @@ int fillBuckets(const float* floatArrayToSort, int size, struct Bucket* buckets,
             bucket->value = currentItem;
             continue;
         }
-        while (bucket->next != NULL) {
-            bucket = bucket->next;
-        }
+
         struct Bucket *newBucket = (struct Bucket *)
                 malloc(sizeof(struct Bucket));
         if (newBucket == NULL) {
             freeBuckets(buckets, bucketCount);
             return 0;
         }
+        newBucket->next = bucket->next;
         bucket->next = newBucket;
+
         newBucket->value = currentItem;
-        newBucket->next = NULL;
-        newBucket->count = 0;
+        newBucket->count = 1;
     }
     return 1;
+}
+
+void mergesort_parallel(float* array, int size, int threads) {
+    if (threads < 2) {
+        mergesort(array, 0, size-1);
+        return;
+    }
+
+    //  EXPLAIN IN DISS. GETTING RID OF TASKS SO THE IMPLEMENTATIONS ARE SIMILAR, ELMINIATING AN EXTERNAL FACTOR THAT COULD PLAY A ROLE IN THE RESULTS.
+    omp_set_dynamic(0);
+    omp_set_nested(1);
+    int portion = size / threads;
+    int remainder = size % threads;
+    int starts[threads];
+    int portions[threads];
+    #pragma omp parallel num_threads(threads)
+    {
+        int start, end, rank;
+        rank = omp_get_thread_num();
+        if (rank < remainder) {
+            start = rank * (portion + 1);
+            end = start + portion + 1;
+            portions[rank] = portion + 1;
+        } else {
+            start = portion * (rank - remainder) + remainder * (portion + 1);
+            end = start + portion;
+            portions[rank] = portion;
+        }
+        starts[rank] = start;
+        mergesort(array, start, end-1);
+    }
+    /* Final merges */
+    int low, mid, high, temp;
+    low = 0;
+    high = portions[0]-1;
+    for (int i = 0; i < threads-1; i++) {
+        temp = portions[i+1]-1 + starts[i+1];
+        mid = high;
+        high = temp;
+        merge(array, low, mid, high);
+    }
 }
 
 void mergesort(float* array, int low, int high) {
     if (low >= high) return;
     int mid = low + (high - low)/2;
-    #pragma omp task default(none) \
-    shared(array, low, mid)
-    {
-        mergesort(array, low, mid); // low -> mid inclusive
-    }
-    #pragma omp task default(none) \
-    shared(array, mid, high)
-    {
-        mergesort(array, mid + 1, high);
-    }
-    #pragma omp taskwait
+    mergesort(array, low, mid); // low -> mid inclusive
+    mergesort(array, mid + 1, high);
     merge(array, low, mid, high);
 }
 
@@ -200,7 +232,19 @@ void merge(float* floatArrayToSort, int low, int mid, int high) {
     int i, j, k;
     int lengthOfA = mid - low + 1; // low -> mid, inclusive
     int lengthOfB = high - mid;
-    float a[lengthOfA], b[lengthOfB];
+    float *a, *b;
+    a = malloc(lengthOfA * sizeof(float));
+    if (a) {
+        b = malloc(lengthOfB * sizeof(float));
+        if (!b) {
+            free(a);
+            return;
+        }
+    }
+    else {
+        return;
+    }
+
     for (i = 0; i < lengthOfA; i++) {
         a[i] = floatArrayToSort[i + low];
     }
@@ -231,39 +275,48 @@ void merge(float* floatArrayToSort, int low, int mid, int high) {
 }
 
 int main() {
-    int size = 10000;
-    float* array = (float*) malloc((size_t) size * sizeof(float));
-    if (array == NULL) return -1;
-    time_t t;
-    srand((unsigned) time(&t));
-    for (int i = 0; i < size; i++) {
-        array[i] = (float) rand() / (float) RAND_MAX;
-    }
-    int incorrectCounter, correctCounter;
-    incorrectCounter = correctCounter = 0;
-    for (int i = 1; i < size; i++) {
-        if (array[i] < array[i-1]) incorrectCounter++;
-        else correctCounter++;
-    }
-    correctCounter++; // final unaccounted number
-//    printf("Initially sorted numbers: %d\nIncorrectly sorted numbers: %d\nTotal numbers: %d\n",
-//           correctCounter, incorrectCounter, size);
-    double start, end;
-    start = omp_get_wtime();
-    if (!bucketsort(array, size, 8, 10)) {
+    for (int k = 1; k < 9; k++) {
+        if (k == 3) k = 4;
+        if (k == 5) k = 6;
+        if (k == 7) k = 8;
+        int size = 1000000;
+        float *array = (float *) malloc((size_t) size * sizeof(float));
+        if (array == NULL) return -1;
+        time_t t;
+        srand((unsigned) time(&t));
+        for (int i = 0; i < size; i++) {
+            array[i] = (float) rand() / (float) RAND_MAX;
+        }
+        int incorrectCounter, correctCounter;
+        incorrectCounter = correctCounter = 0;
+        for (int i = 1; i < size; i++) {
+            if (array[i] < array[i - 1]) incorrectCounter++;
+            else correctCounter++;
+        }
+        correctCounter++; // final unaccounted number
+//        printf("Initially sorted numbers: %d\nIncorrectly sorted numbers: %d\nTotal numbers: %d\n",
+//               correctCounter, incorrectCounter, size);
+        double start, end;
+        int result;
+        start = omp_get_wtime();
+        result = bucketsort(array, size, 1, 1, k);
+        end = omp_get_wtime();
+        if (!result) {
+            free(array);
+            return 0;
+        }
+        incorrectCounter = correctCounter = 0;
+        for (int i = 1; i < size; i++) {
+            if (array[i] < array[i - 1]) incorrectCounter++;
+            else correctCounter++;
+        }
+        correctCounter++; // final unaccounted number
+        printf("Sorted numbers: %d\nIncorrectly sorted numbers: %d\nTotal numbers: %d\n",
+               correctCounter, incorrectCounter, size);
+        printf("Time taken: %g\n", end - start);
+        FILE *f = fopen("times.txt", "a");
+        fprintf(f, "%g,", end - start);
         free(array);
-        return 0;
     }
-    end = omp_get_wtime();
-    incorrectCounter = correctCounter = 0;
-    for (int i = 1; i < size; i++) {
-        if (array[i] < array[i-1]) incorrectCounter++;
-        else correctCounter++;
-    }
-    correctCounter++; // final unaccounted number
-    printf("Sorted numbers: %d\nIncorrectly sorted numbers: %d\nTotal numbers: %d\n",
-           correctCounter, incorrectCounter, size);
-    printf("Time taken: %g\n", end-start);
-    free(array);
     return 0;
 }
