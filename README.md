@@ -1,2 +1,2 @@
 # Bucket-Mergesort-OpenMP
-Parallel implementation of bucketsort with internal mergesort in C, using OpenMP.
+Parallel implementation of the bucketsort algorithm that uses mergesort to sort its buckets, in C using OpenMP.
